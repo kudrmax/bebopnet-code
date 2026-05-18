@@ -60,10 +60,11 @@ class LMOrderedIterator(object):
         data[:, :, 3:] = self.data[i + 1:i + 1 + seq_len, :, 3:]
 
         # The note before EOS should not take the eos chord, rather should maintain its own.
-        # Likewise, the EOS note, should maintain his zero vector for a chord
+        # Likewise, the EOS note, should maintain his zero vector for a chord.
+        # PT 2.x rejects in-place ops on overlapping views (eos_mask[:-1]
+        # and eos_mask[1:] share memory). Replace with out-of-place OR.
         eos_mask = self.data[beg_idx:end_idx + 1, :, 0] == EOS_SYMBOL
-        eos_mask[:-1] += eos_mask[1:]
-        eos_mask = eos_mask[:-1]
+        eos_mask = eos_mask[:-1] | eos_mask[1:]
         eos_mask_expanded = eos_mask.unsqueeze(-1).expand(-1, -1, d_data - 3)
         data[:, :, 3:][eos_mask_expanded] = self.data[beg_idx:end_idx][:, :, 3:][eos_mask_expanded]
         target = self.data[i + 1:i + 1 + seq_len]

@@ -1,5 +1,6 @@
 # coding: utf-8
 import configargparse
+import csv
 import time
 import math
 import os
@@ -9,6 +10,7 @@ import json
 import sys
 from functools import partial
 import random
+from typing import Optional
 
 import numpy as np
 
@@ -86,6 +88,59 @@ def update_dropatt(m, args):
         m.dropatt.p = args.dropatt
 
 
+EPOCHS_CSV_HEADER = [
+    "step",
+    "elapsed_sec",
+    "lr",
+    "val_loss",
+    "val_nll",
+    "val_p_top1",
+    "val_d_top1",
+    "val_p_entropy",
+    "val_d_entropy",
+]
+TRAIN_STATE_FILE = "train_state.json"
+SUMMARY_FILE = "summary.json"
+EPOCHS_CSV_FILE = "epochs.csv"
+
+
+def _save_train_state(
+    work_dir: str,
+    train_step: int,
+    best_val_loss: Optional[float],
+    best_val_p_acc: float,
+    best_val_d_acc: float,
+    train_time_sec: float,
+) -> None:
+    state = {
+        "train_step": int(train_step),
+        "best_val_loss": float(best_val_loss) if best_val_loss is not None else None,
+        "best_val_p_acc": float(best_val_p_acc),
+        "best_val_d_acc": float(best_val_d_acc),
+        "train_time_sec": float(train_time_sec),
+    }
+    with open(os.path.join(work_dir, TRAIN_STATE_FILE), "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _load_train_state(restart_dir: str) -> Optional[dict]:
+    path = os.path.join(restart_dir, TRAIN_STATE_FILE)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _append_epoch_csv(work_dir: str, row: dict) -> None:
+    path = os.path.join(work_dir, EPOCHS_CSV_FILE)
+    write_header = not os.path.isfile(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EPOCHS_CSV_HEADER)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in EPOCHS_CSV_HEADER})
+
+
 class Trainer:
     def __init__(self, in_args):
         if not hasattr(self, 'model_class'):
@@ -140,6 +195,9 @@ class Trainer:
                                     help='evaluation interval')
         logging_parser.add_argument('--work_dir', default='results/training_results/transformer', type=str,
                                     help='experiment directory.')
+        logging_parser.add_argument('--no_timestamp', action='store_true',
+                                    help='do not append a timestamp suffix to work_dir '
+                                         '(stable directory across restarts — needed for resume idempotency)')
 
         model_parser = parser.add_argument_group('Model args')
         model_parser.add_argument('--n_layer', type=int, default=6,
@@ -232,6 +290,10 @@ class Trainer:
                                        help='use the same pos embeddings after clamp_len')
         experiment_parser.add_argument('--max_eval_steps', type=int, default=-1,
                                        help='max eval steps')
+        # fp16 is named in configs/train_model.yml but not used in this script;
+        # accept it so configargparse does not reject the existing config.
+        experiment_parser.add_argument('--fp16', type=str, default='False',
+                                       help='[unused] kept for config compatibility')
 
         self.update_args_defaults(parser)
 
@@ -244,11 +306,12 @@ class Trainer:
 
         assert self.args.ext_len >= 0, 'extended context length must be non-negative'
 
-        if self.args.save_name:
-            self.args.work_dir = os.path.join(self.args.work_dir,
-                                              self.args.save_name + '_' + time.strftime('%Y%m%d-%H%M%S'))
-        else:
-            self.args.work_dir = os.path.join(self.args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
+        if not self.args.no_timestamp:
+            if self.args.save_name:
+                self.args.work_dir = os.path.join(self.args.work_dir,
+                                                  self.args.save_name + '_' + time.strftime('%Y%m%d-%H%M%S'))
+            else:
+                self.args.work_dir = os.path.join(self.args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
 
     def update_args_defaults(self, parser):
         pass
@@ -507,16 +570,62 @@ class Trainer:
                 if self.args.scheduler == 'dev_perf':
                     self.scheduler.step(val_loss)
 
+                # Resume-aware: persist counters + best_val so a fresh process
+                # can continue where it stopped. model.pt remains a pure
+                # state_dict (don't bundle metadata into it — inference reads it).
+                self._train_time_sec = self._resumed_train_time_sec + (time.time() - self._train_start_time)
+                _save_train_state(
+                    self.args.work_dir,
+                    self.train_step,
+                    self.best_val_loss,
+                    self.best_val_p_acc,
+                    self.best_val_d_acc,
+                    self._train_time_sec,
+                )
+                _append_epoch_csv(
+                    self.args.work_dir,
+                    {
+                        "step": self.train_step,
+                        "elapsed_sec": round(self._train_time_sec, 2),
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                        "val_loss": float(val_loss),
+                        "val_nll": float(val_losses_dict.get("nll", 0.0)),
+                        "val_p_top1": float(val_losses_dict.get("p_top1", 0.0)),
+                        "val_d_top1": float(val_losses_dict.get("d_top1", 0.0)),
+                        "val_p_entropy": float(val_losses_dict.get("p_entropy", 0.0)),
+                        "val_d_entropy": float(val_losses_dict.get("d_entropy", 0.0)),
+                    },
+                )
+
                 eval_start_time = time.time()
 
             if self.train_step == self.args.max_step:
                 break
 
     def main(self):
-        self.train_step = 0
-        self.best_val_loss = None
-        self.best_val_p_acc = 0
-        self.best_val_d_acc = 0
+        # Resume-aware initialization: restore counters from train_state.json
+        # if --restart, otherwise start fresh.
+        resumed_state = _load_train_state(self.args.restart_dir) if self.args.restart else None
+        if resumed_state is not None:
+            self.train_step = resumed_state["train_step"]
+            self.best_val_loss = resumed_state["best_val_loss"]
+            self.best_val_p_acc = resumed_state["best_val_p_acc"]
+            self.best_val_d_acc = resumed_state["best_val_d_acc"]
+            self._resumed_train_time_sec = resumed_state.get("train_time_sec", 0.0)
+            self.logging(
+                '[resume] restored train_state: step={}, best_val_loss={}, train_time_sec={:.1f}'.format(
+                    self.train_step, self.best_val_loss, self._resumed_train_time_sec,
+                )
+            )
+        else:
+            self.train_step = 0
+            self.best_val_loss = None
+            self.best_val_p_acc = 0
+            self.best_val_d_acc = 0
+            self._resumed_train_time_sec = 0.0
+
+        self._train_start_time = time.time()
+        self._train_time_sec = self._resumed_train_time_sec
 
         # At any point you can hit Ctrl + C to break out of training early.
         try:
@@ -535,6 +644,49 @@ class Trainer:
             with open(os.path.join(self.args.work_dir, 'optimizer_latest.pt'), 'wb') as f:
                 torch.save(self.optimizer.state_dict(), f)
             self.writer.close()
+            return
+
+        # Training completed cleanly: load model_best.pt, run a final
+        # evaluation on val_iter, and write summary.json. val.pkl contains
+        # split.json[eval]=43 (used for best-checkpoint selection during
+        # training, never for gradient steps). The canonical test=40
+        # (split.json[test]) is held out from this whole script — it is
+        # evaluated separately by evaluate_canonical.py against model_best.pt
+        # and produces final_test_* fields appended to summary.json.
+        best_path = os.path.join(self.args.work_dir, 'model_best.pt')
+        if os.path.isfile(best_path):
+            self.model.load_state_dict(torch.load(best_path), strict=False)
+            self.logging('[summary] loaded model_best.pt for final eval')
+        else:
+            self.logging('[summary] model_best.pt not found — using last weights')
+
+        final_val_loss, final_val_dict = self.evaluate(self.va_iter)
+        self._train_time_sec = self._resumed_train_time_sec + (time.time() - self._train_start_time)
+
+        summary = {
+            'config': {k: v for k, v in self.args.__dict__.items() if not k.startswith('_')},
+            'n_all_param': int(self.args.n_all_param),
+            'n_nonemb_param': int(self.args.n_nonemb_param),
+            'train_time_sec': round(self._train_time_sec, 2),
+            'completed_step': int(self.train_step),
+            'max_step': int(self.args.max_step),
+            'best_val_loss': float(self.best_val_loss) if self.best_val_loss is not None else None,
+            'best_val_ppl': math.exp(self.best_val_loss) if self.best_val_loss is not None else None,
+            'final_val_loss': float(final_val_loss),
+            'final_val_ppl': math.exp(final_val_loss),
+            'final_val_metrics': {k: float(v) for k, v in final_val_dict.items()},
+            'note': 'val.pkl = split.json[eval]=43 (used only for best-checkpoint '
+                    'selection); canonical test=40 is held out and evaluated '
+                    'separately by evaluate_canonical.py (final_test_* fields '
+                    'are appended to this summary by that script)',
+        }
+        with open(os.path.join(self.args.work_dir, SUMMARY_FILE), 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+        self.logging(
+            '[summary] wrote {} (best_val_ppl={:.3f}, final_val_ppl={:.3f})'.format(
+                SUMMARY_FILE, summary['best_val_ppl'], summary['final_val_ppl'],
+            )
+        )
 
 
 if __name__ == '__main__':

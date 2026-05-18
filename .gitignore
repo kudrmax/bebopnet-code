@@ -1,0 +1,16 @@
+# Virtualenv
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Training artefacts (могут быть сотнями MB)
+training_results/
+output/
+result/
+
+# OS
+.DS_Store
+.idea/

@@ -8,6 +8,24 @@ import torch
 import torch.nn.functional as F
 import copy
 
+# bidict 0.14 -> 0.20+ rename: _fwdm/_invm became fwdm/invm. The pickled
+# converter (a bidict) relies on the old names; without this shim every
+# user of MusicGenerator would have to apply the patch themselves before
+# loading the converter pickle. Lives here because this module is the
+# single import point for any downstream consumer (CLI script and any
+# external wrapper).
+import bidict as _bd
+if not hasattr(_bd.BidictBase, '_fwdm'):
+    _bd.BidictBase._fwdm = property(
+        lambda self: self.fwdm,
+        lambda self, v: object.__setattr__(self, 'fwdm', v),
+    )
+if not hasattr(_bd.BidictBase, '_invm'):
+    _bd.BidictBase._invm = property(
+        lambda self: self.invm,
+        lambda self, v: object.__setattr__(self, 'invm', v),
+    )
+
 from jazz_rnn.A_data_prep.gather_data_from_xml import extract_vectors, extract_chords_from_xml
 from jazz_rnn.B_next_note_prediction.generation_utils import RES_LENGTH, early_start_song_dict
 from jazz_rnn.utils.music.vectorXmlConverter import chord_2_vec, NOTE_VECTOR_SIZE, chord_2_vec_on_tensor, tie_2_value
@@ -369,7 +387,7 @@ class MusicGenerator:
         # create new note for the network for next generation
         last_note_in_measure_mask = torch.as_tensor((end_at_end_bar | cross_end_bar_mask).astype(np.long),
                                                     dtype=torch.long, device=self.device)
-        next_chord = [self.chords[measure_idx % self.head_len][c] if last_note_in_measure_mask[ind] == 0 else
+        next_chord = [self.chords[measure_idx % self.head_len][int(c)] if last_note_in_measure_mask[ind] == 0 else
                       self.chords[(measure_idx + 1) % self.head_len][0] for ind, c in
                       enumerate(at_second_half_of_bar)]
         root, scale_pitches, chord_pitches, chord_idx = \

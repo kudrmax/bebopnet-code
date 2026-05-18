@@ -1,5 +1,41 @@
 # BebopNet
 
+## Pretrained weights (Weimar Jazz Database, retrained from scratch)
+
+Weights for the WjazzD-trained BebopNet (used by the diploma comparison
+pipeline) live on Hugging Face:
+[maxkudryashov/bebopnet-1](https://huggingface.co/maxkudryashov/bebopnet-1).
+
+Single run, paper-aligned config (`configs/train_model.yml`), 500 000 steps:
+
+| run | combined ppl (test=40) | pitch top1 | duration top1 | best val_ppl (eval=43) |
+|---|---|---|---|---|
+| `paper-default/` | **46.60** | 32.25% | 43.55% | 45.89 |
+| Madaghiele 2021 (paper retrain) | 44.70 | — | — | — |
+
+Numbers reproduce paper baseline within ~4% — pipeline correctness
+confirmed. Test=40 is the canonical cross-model intersection from
+[`wjazzd_split.json`](https://github.com/kudrmax/jazz-generation-research/blob/master/pipelines/training-pipeline/wjazzd_split.json),
+held out from both training and best-checkpoint selection.
+
+Download (inference only):
+```bash
+pip install -U huggingface_hub
+hf download maxkudryashov/bebopnet-1 \
+  paper-default/model_best.pt \
+  paper-default/converter_and_duration.pkl \
+  paper-default/args.json \
+  paper-default/train_model.yml \
+  --local-dir result
+```
+
+Per-step `epochs.csv`, `summary.json`, `log.txt`:
+- [`results/bebopnet-wjazzd-500K/`](https://github.com/kudrmax/jazz-generation-research/tree/master/pipelines/training-pipeline/results/bebopnet-wjazzd-500K)
+
+Trained via the Colab notebook at `training/colab_train.ipynb`.
+
+---
+
 This repository contains PyTorch implementation and a trained model for our paper:
 
 > [BebopNet: Deep Neural Models for Personalized Jazz Improvisations](https://program.ismir2020.net/poster_6-08.html)   

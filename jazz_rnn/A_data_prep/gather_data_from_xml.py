@@ -11,7 +11,7 @@ from fractions import Fraction
 
 import torch.multiprocessing as mp
 from jazz_rnn.utils.music.vectorXmlConverter import *
-from jazz_rnn.C_reward_induction.online_tagger_gauge import SongLabels
+# from jazz_rnn.C_reward_induction.online_tagger_gauge import SongLabels  # disabled: tkinter; SongLabels not used here
 
 # A vector consists of:
 # [0]       1 int  - pitch can get value from 0 to 127
@@ -62,6 +62,13 @@ def extract_data_from_xml(args):
     else:
         args.reward_induction = False
 
+    # TODO(cross-model SSoT): replace physical train/test directory split with
+    # a read of diploma2/pipelines/training-pipeline/wjazzd_split.json. Today
+    # split is determined by where xml files are placed under args.xml_dir;
+    # for cross-model comparison with CMT/MINGUS, the prep script should
+    # route files into train/eval/test by song_id from split.json rather than
+    # by physical layout. After the switch: BebopNet trains/tests on the same
+    # subset CMT and MINGUS use, and split.json[test] (40 files) is canonical.
     if args.reward_induction:
         train_songs = glob.glob(args.xml_dir + "/train/xml_with_chords/*.xml")
         test_songs = glob.glob(args.xml_dir + "/test/xml_with_chords/*.xml")
@@ -95,21 +102,23 @@ def extract_data_from_xml(args):
             durations = pickle.load(input_converter)
 
     n_proc = min(args.num_processes, len(train_songs))
+    partial_extract_vectors = partial(extract_vectors, ri=args.reward_induction,
+                                      song_labels_dict=song_labels_dict,
+                                      converter=converter, no_eos=args.no_eos)
     if n_proc > 1:
         pool = mp.Pool(processes=n_proc)
-        partial_extract_vectors = partial(extract_vectors, ri=args.reward_induction,
-                                          song_labels_dict=song_labels_dict,
-                                          converter=converter, no_eos=args.no_eos)
-
         train_results = pool.map(partial_extract_vectors, train_songs)
         if not args.no_test:
             test_results = pool.map(partial_extract_vectors, test_songs)
         pool.close()
         pool.join()
-    else:  # used for debug
-        train_results = extract_vectors(song=train_songs[0], ri=args.reward_induction,
-                                        song_labels_dict=song_labels_dict,
-                                        converter=converter, no_eos=args.no_eos)
+    else:
+        # sequential path — used for debug AND when mp.Pool deadlocks
+        # (macOS spawn + music21 globals can hang). Authorial code only
+        # processed train_songs[0]; we map over all songs for parity.
+        train_results = list(map(partial_extract_vectors, train_songs))
+        if not args.no_test:
+            test_results = list(map(partial_extract_vectors, test_songs))
 
     train_data = results_2_dict(train_results, train_songs)
     if not args.no_test:
@@ -306,12 +315,18 @@ def remove_consecutive_rest_vars(data_dict, converter, ri, no_eos=False):
         while i < len(data) - 1:
             if is_rest_measure(data, i) and is_rest_measure(data, i + 1):
                 j = 2
-                while is_rest_measure(data, i + j):
+                # Bound check: authorial code didn't guard the inner while —
+                # IndexError on a song whose tail is all rests.
+                while i + j < len(data) and is_rest_measure(data, i + j):
                     j += 1
                 i += j
-                del new_data_dict[name][-1]
-                if not no_eos:
-                    add_eos(new_data_dict[name], ri=ri)
+                # Bound check: del [-1] on an empty list raises IndexError
+                # — happens when the song starts with two consecutive whole
+                # rests (nothing has been appended yet).
+                if new_data_dict[name]:
+                    del new_data_dict[name][-1]
+                    if not no_eos:
+                        add_eos(new_data_dict[name], ri=ri)
             else:
                 new_data_dict[name].append(data[i])
                 i += 1
@@ -363,10 +378,16 @@ def extract_vectors(song, ri, song_labels_dict, converter, no_eos=False):
                         note_with_tie = [pitch, duration, offset, current_chord]
 
                 elif tie_type == 'continue':
-                    note_with_tie[1] = note_with_tie[1] + duration
+                    if note_with_tie is None:
+                        note_with_tie = [pitch, duration, offset, current_chord]
+                    else:
+                        note_with_tie[1] = note_with_tie[1] + duration
 
                 elif tie_type == 'stop':
-                    note_with_tie[1] = note_with_tie[1] + duration
+                    if note_with_tie is None:
+                        note_with_tie = [pitch, duration, offset, current_chord]
+                    else:
+                        note_with_tie[1] = note_with_tie[1] + duration
                     if ri:
                         label_idx = int(total_offset) + int((total_offset % 1) > 0)
                         try:
@@ -391,8 +412,21 @@ def extract_vectors(song, ri, song_labels_dict, converter, no_eos=False):
                         break
                 data = add_to_db(converter, data, pitch, duration, offset, current_chord, ri, label)
     except NoChordError:
-        print('missing a chord in {}'.format(song))
-        exit(1)
+        # Authorial code did exit(1) here, killing the whole gather. That
+        # branch never fired on the authors' dataset; on WjazzD it does
+        # (e.g. 254_Kenny_Dorham_Punjab_Solo, 396_Sonny_Stitt_Teapot_Solo).
+        # Skip the song instead — dict_2_np filters empty entries.
+        print('missing a chord in {} — skipping'.format(song))
+        return []
+    except ValueError as e:
+        # Authorial chord_2_vec raises ValueError for chord kinds outside
+        # its hard-coded dictionary (e.g. 'augmented-major-seventh'
+        # in 307_Michael_Brecker_Peep_Solo). Same canonical workflow
+        # as NoChordError — drop the song.
+        if 'unrecognized chord' in str(e):
+            print('unrecognized chord in {} ({}) — skipping'.format(song, e))
+            return []
+        raise
     if not no_eos:
         add_eos(data, ri=ri)
     return data

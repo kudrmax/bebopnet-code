@@ -326,15 +326,16 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         #### compute attention probability
         if attn_mask is not None and attn_mask.any().item():
-            if attn_mask.dim() == 2:
+            attn_mask_b = attn_mask.bool() if attn_mask.dtype != torch.bool else attn_mask
+            if attn_mask_b.dim() == 2:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[None, :, :, None], -float('inf')).type_as(attn_score)
-            elif attn_mask.dim() == 3:
+                    attn_mask_b[None, :, :, None], -float('inf')).type_as(attn_score)
+            elif attn_mask_b.dim() == 3:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[:, :, :, None], -float('inf')).type_as(attn_score)
-            elif attn_mask.dim() == 4:
+                    attn_mask_b[:, :, :, None], -float('inf')).type_as(attn_score)
+            elif attn_mask_b.dim() == 4:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask, -float('inf')).type_as(attn_score)
+                    attn_mask_b, -float('inf')).type_as(attn_score)
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
         attn_prob = self.dropatt(attn_prob)
@@ -616,7 +617,7 @@ class MemTransformerLM(nn.Module):
 
         # eos has no chord, so we need to mask it out
         eos_mask = eos_mask.view(-1)
-        eos_mask = 1 - eos_mask
+        eos_mask = (1 - eos_mask.long()).bool() if eos_mask.dtype == torch.bool else 1 - eos_mask
         chord_pitches = chord_pitches.view(-1, 13)
         chord_pitch_idxs_no_eos = chord_pitches.nonzero()[:, 1] + OFFSET_TO_5OCT
         chord_pitch_idxs = torch.zeros(shape[0] * shape[1], 4, device=chord_pitches.device, dtype=chord_pitches.dtype)

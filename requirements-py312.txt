@@ -1,0 +1,24 @@
+# BebopNet — runtime requirements for Python 3.12 на arm64 macOS.
+# Используется pipeline'ом jazz-generation-pipeline для inference.
+#
+# Pinned to versions that were end-to-end tested with our patches.
+# Transitive deps resolved by pip.
+#
+# Install:
+#   python3.12 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements-py312.txt
+
+torch==2.11.0
+numpy==2.4.4
+music21==9.9.1
+lxml==6.1.0
+pretty_midi==0.2.11
+PyYAML==6.0.3
+bidict==0.23.1
+ConfigArgParse==1.7.5
+imbalanced-learn==0.14.1
+scipy==1.17.1
+tqdm==4.67.3
+matplotlib==3.10.9
+pandas==3.0.2

@@ -37,7 +37,9 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        # PT 2.x: correct[:k] is non-contiguous after slicing+expand,
+        # .view() rejects it. .reshape() handles both contiguous and not.
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
